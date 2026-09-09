@@ -1,0 +1,43 @@
+cmake_minimum_required(VERSION 3.20)
+project(can_ecu_simulator VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+function(enable_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    endif()
+endfunction()
+
+add_library(can_protocol common/can/CanProtocol.cpp)
+target_include_directories(can_protocol PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+enable_warnings(can_protocol)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(Threads REQUIRED)
+    add_library(socketcan platform/linux/SocketCanDriver.cpp)
+    target_link_libraries(socketcan PUBLIC can_protocol)
+    enable_warnings(socketcan)
+
+    add_executable(engine_ecu engine_ecu/main.cpp)
+    target_link_libraries(engine_ecu PRIVATE socketcan Threads::Threads)
+    enable_warnings(engine_ecu)
+
+    add_executable(dashboard_ecu dashboard_ecu/main.cpp)
+    target_link_libraries(dashboard_ecu PRIVATE socketcan)
+    enable_warnings(dashboard_ecu)
+else()
+    message(STATUS "SocketCAN executables require Linux; building portable protocol code and tests only")
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(protocol_tests tests/protocol_tests.cpp)
+    target_link_libraries(protocol_tests PRIVATE can_protocol)
+    enable_warnings(protocol_tests)
+    add_test(NAME protocol_tests COMMAND protocol_tests)
+endif()
