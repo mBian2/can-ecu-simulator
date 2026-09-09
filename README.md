@@ -3,18 +3,21 @@
 An automotive ECU simulation built with C++17. The current desktop prototype
 uses two Linux processes to exchange engine telemetry over SocketCAN: the engine
 publishes every 100 ms, and the dashboard validates and prints each message.
-The protocol library and its tests also build on Windows.
+The engine controller and protocol libraries also build and run their tests on Windows.
 
 ```mermaid
 flowchart LR
-    engine[Engine ECU] -->|Encoded status every 100 ms| bus[vcan0 / SocketCAN]
+    demo[Demo inputs] --> controller[Engine controller]
+    controller -->|EngineStatus| publisher[Engine ECU loop]
+    publisher -->|Telemetry every 100 ms| bus[vcan0 / SocketCAN]
     bus -->|Validated telemetry| dashboard[Dashboard ECU]
 ```
 
-The project is being developed toward STM32 and Zephyr support. This version
-implements desktop communication only; hardware firmware, diagnostics, and fault
-monitoring are future work. Its throttle sweep generates repeatable traffic;
-it is not a physical engine model.
+The engine models Off, Starting, Idle, and Running states, with gradual RPM and
+temperature changes. A repeating demo supplies ignition and throttle inputs.
+The project is being developed toward STM32 and Zephyr support; hardware firmware,
+diagnostics, and fault monitoring remain future work. This is a simplified engine
+model, not a combustion or vehicle-physics simulation.
 
 ## Build and test
 
@@ -47,7 +50,7 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-Windows builds only the portable library and protocol tests. Running the two
+Windows builds the portable controller and protocol libraries and unit tests. Running the two
 applications requires a Linux host or a WSL installation whose kernel supports
 CAN and vcan. Windows test results do not validate Linux socket behavior.
 
@@ -90,14 +93,39 @@ Example dashboard output near the start of an engine run:
 
 ```text
 Dashboard listening on vcan0. Ctrl+C to stop.
-RPM: 800 | Coolant: 80 C | Throttle: 0%
-RPM: 845 | Coolant: 80 C | Throttle: 1%
-RPM: 890 | Coolant: 80 C | Throttle: 2%
+RPM: 0 | Coolant: 20 C | Throttle: 0%
+RPM: 0 | Coolant: 20 C | Throttle: 0%
+RPM: 0 | Coolant: 20 C | Throttle: 0%
 ```
 
-The first observed sample depends on when each process starts. Throttle rises
-from 0% to 100% and falls back over 20 seconds; RPM and temperature follow it.
+The first observed sample depends on when each process starts. The demo repeats
+every 12 seconds:
+
+| Time within cycle | Behavior |
+| --- | --- |
+| 0–1 s | Ignition off; zero RPM and throttle |
+| 1–2 s | Starting; RPM ramps to 800, throttle held at zero |
+| 2–3 s | Idling at 800 RPM |
+| 3–6 s | 60% throttle; RPM rises toward 3,500 |
+| 6–8 s | Throttle released; RPM falls toward 800 |
+| 8–12 s | Ignition off; RPM stops immediately and coolant cools |
+
+The engine prints its initial state and each transition once:
+
+```text
+State: Off
+State: Off -> Starting
+State: Starting -> Idle
+State: Idle -> Running
+State: Running -> Idle
+State: Idle -> Off
+```
+
+The controller advances in 20 ms simulated steps; telemetry is sent every 100 ms.
 Missed transmission slots are skipped rather than sent in a catch-up burst.
+An application stall of more than one second is reported as an error. Coolant
+temperature persists between demo cycles; restarting the process resets the model.
+The [engine model](docs/engine_model.md) documents timing, transitions, and assumptions.
 
 ## Manual Linux checks
 
@@ -138,9 +166,9 @@ are logged and skipped. A saturated transmit queue is reported as a send error.
 
 - `common/can`: fixed-capacity frame, protocol codec, and small driver interface.
 - `platform/linux`: noncopyable socket owner; opens/binds once and closes on exit.
-- `engine_ecu`: deterministic telemetry and periodic transmission.
+- `engine_ecu`: portable controller, separate demo inputs, and Linux scheduling/transmission.
 - `dashboard_ecu`: receive loop, validation, and text output.
-- `tests`: protocol unit tests and a Linux SocketCAN integration test.
+- `tests`: controller/protocol unit tests and a Linux SocketCAN integration test.
 
 Frames and codec results use fixed-size storage. No payload allocation occurs in
 the codec or driver processing path. Startup strings, error formatting, and C++
