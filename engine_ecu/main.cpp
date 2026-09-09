@@ -1,4 +1,6 @@
 #include "common/can/CanProtocol.hpp"
+#include "engine_ecu/DemoScenario.hpp"
+#include "engine_ecu/EngineController.hpp"
 #include "platform/linux/SocketCanDriver.hpp"
 
 #include <chrono>
@@ -20,6 +22,7 @@ void requestStop(int) {
 int main(int argc, char* argv[]) {
     if (argc > 2 || (argc == 2 && std::string(argv[1]) == "--help")) {
         std::cout << "Usage: engine_ecu [CAN interface, default: vcan0]\n";
+        std::cout << "Runs a repeating 12-second ignition/throttle demonstration.\n";
         return argc > 2 ? 1 : 0;
     }
     const std::string interfaceName = argc == 2 ? argv[1] : "vcan0";
@@ -31,42 +34,54 @@ int main(int argc, char* argv[]) {
         std::cout << "Engine transmitting on " << interfaceName
                   << " every 100 ms. Ctrl+C to stop." << std::endl;
         using Clock = std::chrono::steady_clock;
-        constexpr auto period = std::chrono::milliseconds(100);
+        constexpr auto updatePeriod = std::chrono::milliseconds(20);
+        constexpr auto transmitPeriod = std::chrono::milliseconds(100);
         const auto started = Clock::now();
         auto nextSend = started;
+        auto simulationTime = std::chrono::milliseconds::zero();
+        ecu::EngineController controller;
+        std::cout << "State: " << ecu::describe(controller.state()) << std::endl;
 
         while (!stopRequested) {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
-            // A repeating 20-second throttle sweep gives reproducible traffic.
-            // This is a telemetry demo, not an engine physics model.
-            const int phase = static_cast<int>((elapsed / 100) % 200);
-            const int throttle = phase <= 100 ? phase : 200 - phase;
-            const ecu::EngineStatus status{
-                static_cast<std::uint16_t>(800 + throttle * 45),
-                static_cast<std::int16_t>(80 + throttle / 5),
-                static_cast<std::uint8_t>(throttle)};
-            const auto frame = ecu::serialize(status);
-            if (!frame) {
-                throw std::runtime_error("simulation produced invalid telemetry");
+            const auto wallElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - started);
+            // Bound catch-up work to 50 steps. A long stall is reported rather
+            // than silently dropping model time or racing through a backlog.
+            if (wallElapsed - simulationTime > ecu::EngineParameters::maximumUpdate) {
+                throw std::runtime_error("simulation fell more than one second behind its clock");
             }
-            if (const auto error = driver.send(*frame)) {
-                if (stopRequested && error == std::errc::interrupted) {
-                    break;
+            while (simulationTime + updatePeriod <= wallElapsed) {
+                const auto previous = controller.state();
+                if (controller.update(ecu::demoInputs(simulationTime), updatePeriod) !=
+                    ecu::UpdateError::None) {
+                    throw std::runtime_error("invalid engine simulation update");
                 }
-                throw std::system_error(error, "send engine status on " + interfaceName);
+                simulationTime += updatePeriod;
+                if (controller.state() != previous) {
+                    std::cout << "State: " << ecu::describe(previous) << " -> "
+                              << ecu::describe(controller.state()) << std::endl;
+                }
             }
-            nextSend += period;
             const auto now = Clock::now();
-            // Skip missed slots instead of sending a burst after a long stall.
-            if (nextSend <= now) {
-                nextSend += period * ((now - nextSend) / period + 1);
+            if (now >= nextSend) {
+                const auto frame = ecu::serialize(controller.telemetry());
+                if (!frame) {
+                    throw std::runtime_error("simulation produced invalid telemetry");
+                }
+                if (const auto error = driver.send(*frame)) {
+                    if (stopRequested && error == std::errc::interrupted) {
+                        break;
+                    }
+                    throw std::system_error(error, "send engine status on " + interfaceName);
+                }
+                // Send the current sample once, even when several slots were missed.
+                nextSend += transmitPeriod * ((now - nextSend) / transmitPeriod + 1);
             }
-            std::this_thread::sleep_until(nextSend);
+            std::this_thread::sleep_until(started + simulationTime + updatePeriod);
         }
         std::cout << "Engine stopped.\n";
     } catch (const std::exception& error) {
-        std::cerr << "engine_ecu: " << error.what()
-                  << "\nCheck that the CAN interface exists and is up (see README).\n";
+        std::cerr << "engine_ecu: " << error.what() << '\n';
         return 1;
     }
 }

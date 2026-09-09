@@ -47,6 +47,42 @@ def stop(process, log_path):
     require(process.wait(timeout=3) == 0, f"Unclean shutdown:\n{log_path.read_text()}")
 
 
+def observe_lifecycle(bus):
+    # Check successive wire observations, not a change in the first 600 ms:
+    # the demonstration intentionally begins with the engine switched off.
+    stages = [
+        ("off", lambda rpm, throttle: rpm == 0 and throttle == 0),
+        ("starting", lambda rpm, throttle: 0 < rpm < 800 and throttle == 0),
+        ("idle", lambda rpm, throttle: rpm == 800 and throttle == 0),
+        ("running", lambda rpm, throttle: rpm >= 3000 and throttle == 60),
+        ("decelerating", lambda rpm, throttle: 800 < rpm < 3500 and throttle == 0),
+        ("idle again", lambda rpm, throttle: rpm == 800 and throttle == 0),
+        ("off again", lambda rpm, throttle: rpm == 0 and throttle == 0),
+    ]
+    next_stage = 0
+    temperatures = []
+    deadline = time.monotonic() + 20
+    while next_stage < len(stages) and time.monotonic() < deadline:
+        # Linux can_frame uses native byte order for its header. EngineStatus
+        # fields have their own explicitly big-endian wire representation.
+        bus.settimeout(min(3, max(0.001, deadline - time.monotonic())))
+        try:
+            raw_frame = bus.recv(16)
+        except TimeoutError as error:
+            raise RuntimeError(f"No telemetry while waiting for {stages[next_stage][0]}") from error
+        identifier, length, payload = struct.unpack("=IB3x8s", raw_frame)
+        require(identifier == 0x100 and length == 5, "Unexpected engine frame")
+        rpm, temperature, throttle = struct.unpack(">HhB", payload[:5])
+        require(0 <= rpm <= 12000 and -40 <= temperature <= 215 and
+                0 <= throttle <= 100, "Invalid engine telemetry")
+        temperatures.append(temperature)
+        if stages[next_stage][1](rpm, throttle):
+            next_stage += 1
+    require(next_stage == len(stages),
+            f"Incomplete engine lifecycle; observed {next_stage} of {len(stages)} stages")
+    require(max(temperatures) > temperatures[0], "Engine did not warm during its lifecycle")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=pathlib.Path, default=pathlib.Path("build"))
@@ -89,19 +125,15 @@ def main():
                 wait_for_output(receiver, dashboard_log, "Dashboard listening")
                 with running(engine, args.interface, engine_log) as sender:
                     wait_for_output(sender, engine_log, "Engine transmitting")
-                    samples = []
-                    for _ in range(6):
-                        # Linux can_frame: native uint32 ID, length, three pad
-                        # bytes, then eight data bytes. Payload fields are big-endian.
-                        identifier, length, payload = struct.unpack("=IB3x8s", bus.recv(16))
-                        require(identifier == 0x100 and length == 5, "Unexpected engine frame")
-                        rpm, temperature, throttle = struct.unpack(">HhB", payload[:5])
-                        require(0 <= rpm <= 12000 and -40 <= temperature <= 215 and
-                                0 <= throttle <= 100, "Invalid engine telemetry")
-                        samples.append(rpm)
-                    require(len(set(samples)) > 1, "Engine telemetry did not change")
-                    wait_for_output(receiver, dashboard_log, "RPM:")
+                    observe_lifecycle(bus)
+                    wait_for_output(receiver, dashboard_log, "RPM: 3500")
                     stop(sender, engine_log)
+                    transitions = [line for line in engine_log.read_text().splitlines()
+                                   if line.startswith("State:")]
+                    require(transitions == [
+                        "State: Off", "State: Off -> Starting", "State: Starting -> Idle",
+                        "State: Idle -> Running", "State: Running -> Idle", "State: Idle -> Off",
+                    ], f"Missing, repeated, or out-of-order state logs: {transitions}")
 
                 fixtures = [
                     (0x100, "09C4005B", "requires exactly 5 bytes"),
@@ -121,7 +153,7 @@ def main():
                 require(output.count("Ignored frame") == 5,
                         f"Dashboard did not reject all five malformed frames:\n{output}")
 
-    print("PASS: help, missing interfaces, idle receive, telemetry, malformed frames, and Ctrl+C")
+    print("PASS: help, missing interfaces, idle receive, engine lifecycle, malformed frames, and Ctrl+C")
 
 
 if __name__ == "__main__":
